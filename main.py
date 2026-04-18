@@ -47,7 +47,7 @@ def _print_banner() -> None:
         return value[:4] + "****" + value[-4:]
 
     print("\n" + "=" * 60)
-    print("  🤖  AI AUTO CALLER — Starting Up")
+    print("  AI AUTO CALLER — Starting Up")
     print("=" * 60)
     print(f"  Server        : {config.SERVER_HOST}:{config.SERVER_PORT}")
     print(f"  Public URL    : {config.PUBLIC_BASE_URL}")
