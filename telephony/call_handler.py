@@ -79,10 +79,10 @@ def _synthesize_speech(text: str, language: str) -> bytes:
     """
     voice_cfg = voice_selector.get_voice_config(language)
     try:
-        audio_generator = elevenlabs_client.generate(
+        audio_generator = elevenlabs_client.text_to_speech.convert(
             text=text,
-            voice=voice_cfg["voice_id"],
-            model=voice_cfg["model_id"],
+            voice_id=voice_cfg["voice_id"],
+            model_id=voice_cfg["model_id"],
         )
         mp3_bytes = b"".join(audio_generator)
         mulaw = mp3_to_mulaw(mp3_bytes)
@@ -169,13 +169,23 @@ async def handle_inbound_call(request: Request) -> Response:
     1. Greets the caller with a brief message.
     2. Connects to a bidirectional Media Stream WebSocket.
     """
-    form = await request.form()
-    call_sid = form.get("CallSid", "unknown")
+    try:
+        form = await request.form()
+    except AssertionError as exc:
+        raise HTTPException(status_code=400, detail="multipart form parse error") from exc
 
-    logger.info("Inbound call received: %s", call_sid)
+    call_sid = form.get("CallSid", "unknown")
+    caller_number = form.get("From", "")
+    called_number = form.get("To", "")
+
+    logger.info("Inbound call received: %s (From: %s)", call_sid, caller_number)
 
     # Initialize conversation state for this call
-    state = conversation_state.create_state(call_sid)
+    state = conversation_state.create_state(
+        call_sid=call_sid,
+        caller_number=caller_number,
+        called_number=called_number,
+    )
     _active_calls[call_sid] = state
 
     # Build TwiML
@@ -186,7 +196,8 @@ async def handle_inbound_call(request: Request) -> Response:
         language="en-IN",
     )
     connect = Connect()
-    stream = Stream(url=f"{config.PUBLIC_BASE_URL}/call/stream/{call_sid}")
+    ws_url = config.PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+    stream = Stream(url=f"{ws_url}/call/stream/{call_sid}")
     stream.parameter(name="callSid", value=call_sid)
     connect.append(stream)
     twiml.append(connect)
@@ -223,6 +234,15 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
             url=f"{config.PUBLIC_BASE_URL}/call/inbound",
         )
         logger.info("Outbound call initiated: %s → %s", call.sid, to_number)
+
+        # Pre-initialize state so we know the recipient number when webhook hits
+        state = conversation_state.create_state(
+            call_sid=call.sid,
+            caller_number=to_number,  # The AI is calling *them*, so they are the "caller" target for WhatsApp
+            called_number=config.TWILIO_PHONE_NUMBER,
+        )
+        _active_calls[call.sid] = state
+
         return JSONResponse({
             "status": "initiated",
             "call_sid": call.sid,

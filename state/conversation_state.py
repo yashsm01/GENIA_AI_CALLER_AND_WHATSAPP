@@ -35,30 +35,49 @@ class ConversationState:
 
     Attributes:
         call_sid:              Unique Twilio call SID.
+        caller_number:         Phone number of the caller (e.g. '+91XXXXXXXXXX').
+        called_number:         Twilio number that was called.
+        customer_name:         Optional name resolved during call.
         current_language:      Active language code (en/hi/gu/hinglish/gujlish).
         language_history:      Rolling list of per-turn DetectionResult objects.
         messages:              GPT message history [{role, content}, ...].
         pending_lang:          Language code being evaluated for stable switch.
         pending_lang_count:    How many consecutive turns pending_lang was seen.
         turn_count:            Total number of completed conversation turns.
+        actions_taken:         Log of all tool actions executed this call.
     """
 
     call_sid: str
+    caller_number: str = ""
+    called_number: str = ""
+    customer_name: str = ""
     current_language: str = field(default_factory=lambda: config.DEFAULT_LANGUAGE)
     language_history: list[dict] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
     pending_lang: str | None = None
     pending_lang_count: int = 0
     turn_count: int = 0
+    actions_taken: list[dict] = field(default_factory=list)
 
 
 # ─── Factory ──────────────────────────────────────────────────────────────────
 
 
-def create_state(call_sid: str) -> ConversationState:
+def create_state(
+    call_sid: str,
+    caller_number: str = "",
+    called_number: str = "",
+) -> ConversationState:
     """Create a fresh ConversationState for a new call."""
-    logger.info("Creating conversation state for call: %s", call_sid)
-    return ConversationState(call_sid=call_sid)
+    logger.info(
+        "Creating conversation state for call: %s (from=%s, to=%s)",
+        call_sid, caller_number, called_number,
+    )
+    return ConversationState(
+        call_sid=call_sid,
+        caller_number=caller_number,
+        called_number=called_number,
+    )
 
 
 # ─── State Mutations ──────────────────────────────────────────────────────────
@@ -175,12 +194,21 @@ def reset(state: ConversationState) -> None:
     logger.info("[%s] State reset.", state.call_sid)
 
 
+def log_action(state: ConversationState, action: str, result: str) -> None:
+    """Record a tool action that was executed during the call."""
+    entry = {"turn": state.turn_count, "action": action, "result": result}
+    state.actions_taken.append(entry)
+    logger.info("[%s] Action logged: %s → %s", state.call_sid, action, result)
+
+
 def get_summary(state: ConversationState) -> dict:
     """Return a loggable summary of the conversation state."""
     return {
         "call_sid": state.call_sid,
+        "caller_number": state.caller_number,
         "current_language": state.current_language,
         "turn_count": state.turn_count,
         "message_count": len(state.messages),
+        "actions_taken": state.actions_taken,
         "last_detection": state.language_history[-1] if state.language_history else None,
     }
