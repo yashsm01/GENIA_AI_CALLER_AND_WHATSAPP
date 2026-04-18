@@ -28,6 +28,10 @@ from telephony.call_handler import app  # noqa: F401  (imported for uvicorn)
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 
+# Force UTF-8 output so terminal doesn't mangle characters
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

@@ -40,6 +40,7 @@ from telephony.audio_utils import (
     encode_audio_for_twilio,
     build_twilio_media_message,
 )
+from telephony.vad_handler import VADHandler
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register ElevenLabs ConvAI bridge router (always included, activated via config flag)
+from telephony import elevenlabs_bridge  # noqa: E402
+app.include_router(elevenlabs_bridge.router)
+
 # ─── Clients ──────────────────────────────────────────────────────────────────
 
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
@@ -61,11 +66,16 @@ elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
 # ─── Active Sessions ──────────────────────────────────────────────────────────
 
-# call_sid → ConversationState
+# call_sid -> ConversationState
 _active_calls: dict[str, conversation_state.ConversationState] = {}
 
-# Minimum μ-law bytes to accumulate before transcribing (≈1.5 seconds at 8kHz)
-_AUDIO_BUFFER_MIN_BYTES = 12_000
+# Bytes to skip at the start of a call to absorb the Twilio greeting echo
+# 8000 bytes/sec * 3.5 sec = 28,000 bytes
+_GREETING_SKIP_BYTES = 28_000
+
+# Bytes to skip after AI finishes speaking to prevent response echo triggering a new turn
+# 8000 bytes/sec * 1.5 sec = 12,000 bytes
+_POST_RESPONSE_SKIP_BYTES = 12_000
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -108,46 +118,71 @@ async def _process_turn(
     Run one full conversation turn:
     Whisper → Detect → GPT → ElevenLabs → Twilio stream.
     """
-    # ── 1. Transcribe ────────────────────────────────────────────────────────
+    sid = state.call_sid
+
+    # -- Pipeline Header -------------------------------------------------------
+    logger.info(f"[{sid}] +--- Turn {state.turn_count + 1} START --- (lang={state.current_language} | audio={len(audio_buffer)} bytes)")
+
+    # -- 1. Transcribe ---------------------------------------------------------
+    logger.info(f"[{sid}] | [1/6] Whisper: transcribing {len(audio_buffer)} bytes of mulaw audio...")
     transcript = whisper_handler.transcribe(audio_buffer, audio_format="mulaw")
     if not transcript:
-        logger.debug("[%s] Empty transcript, skipping turn.", state.call_sid)
+        logger.info(f"[{sid}] +--- Turn END (empty transcript - no speech detected)")
         return
 
-    logger.info("[%s] User said: %r", state.call_sid, transcript)
+    logger.info(f"[{sid}] |      USER SAID  >> {transcript!r}")
 
-    # ── 2. Detect language ───────────────────────────────────────────────────
+    # -- 2. Detect language ----------------------------------------------------
+    logger.info(f"[{sid}] | [2/6] Language Detector: analyzing...")
     result = language_detector.detect(transcript, state.current_language)
+    before_lang = state.current_language
     conversation_state.update_language(state, result)
+    after_lang = state.current_language
+    if before_lang != after_lang:
+        logger.info(f"[{sid}] |      LANG SWITCH  {before_lang} -> {after_lang}  (confidence={result.confidence:.2f})")
+    else:
+        logger.info(f"[{sid}] |      LANG STABLE  {after_lang}  (confidence={result.confidence:.2f})")
 
-    # ── 3. Add user message to history ──────────────────────────────────────
+    # -- 3. Add user message to history ----------------------------------------
     conversation_state.add_message(state, "user", transcript)
+    logger.info(f"[{sid}] | [3/6] History: user message appended (total {len(state.messages)} messages)")
 
-    # ── 4. Generate GPT response ─────────────────────────────────────────────
+    # -- 4. Generate GPT response -----------------------------------------------
+    logger.info(f"[{sid}] | [4/6] GPT-4o: generating response...")
     reply = gpt_handler.generate_response(state)
     conversation_state.add_message(state, "assistant", reply)
     conversation_state.increment_turn(state)
 
-    logger.info("[%s] AI reply: %r", state.call_sid, reply)
+    logger.info(f"[{sid}] |      AI REPLY   << {reply!r}")
 
-    # ── 5. Synthesize voice ──────────────────────────────────────────────────
+    # Log if any tools were called during this turn
+    if state.actions_taken:
+        last_action = state.actions_taken[-1]
+        logger.info(f"[{sid}] |      TOOL USED  [*] {last_action.get('action', 'unknown')}")
+
+    # -- 5. Synthesize voice ---------------------------------------------------
+    logger.info(f"[{sid}] | [5/6] ElevenLabs: synthesizing speech ({len(reply)} chars)...")
     mulaw_audio = _synthesize_speech(reply, state.current_language)
     if not mulaw_audio:
-        logger.error("[%s] Voice synthesis failed, turn skipped.", state.call_sid)
+        logger.error(f"[{sid}] |      [!] Voice synthesis FAILED - caller will hear silence this turn.")
+        logger.info(f"[{sid}] +--- Turn {state.turn_count} END (synthesis fail)")
         return
 
-    # ── 6. Stream audio back to Twilio ───────────────────────────────────────
+    logger.info(f"[{sid}] |      [OK] Speech synthesized ({len(mulaw_audio)} mulaw bytes)")
+
+    # -- 6. Stream audio back to Twilio ----------------------------------------
+    logger.info(f"[{sid}] | [6/6] Twilio: encoding and streaming audio...")
     b64_audio = encode_audio_for_twilio(mulaw_audio)
+    if not b64_audio:
+        logger.error(f"[{sid}] |      [!] Audio encoding FAILED - skipping send.")
+        logger.info(f"[{sid}] +--- Turn {state.turn_count} END (encoding fail)")
+        return
+
     media_msg = build_twilio_media_message(b64_audio, stream_sid)
     await websocket.send_text(json.dumps(media_msg))
 
-    logger.info(
-        "[%s] Turn %d complete | lang=%s | reply_len=%d",
-        state.call_sid,
-        state.turn_count,
-        state.current_language,
-        len(reply),
-    )
+    logger.info(f"[{sid}] |      [OK] Audio streamed to caller ({len(b64_audio)} b64 chars)")
+    logger.info(f"[{sid}] +--- Turn {state.turn_count} COMPLETE --- (lang={state.current_language} | reply={len(reply)} chars)")
 
 
 # ─── HTTP Endpoints ───────────────────────────────────────────────────────────
@@ -194,14 +229,24 @@ async def handle_inbound_call(request: Request) -> Response:
 
     # Build TwiML
     twiml = VoiceResponse()
-    twiml.say(
-        "Hello! AI caller connected. How can I help you today?",
-        voice="alice",
-        language="en-IN",
-    )
-    connect = Connect()
     ws_url = config.PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
-    stream = Stream(url=f"{ws_url}/call/stream/{call_sid}")
+
+    if config.USE_ELEVENLABS_CONVAI:
+        # ElevenLabs ConvAI mode — register state with bridge and skip greeting
+        elevenlabs_bridge.register_call(call_sid, state)
+        logger.info("[%s] Using ElevenLabs ConvAI bridge.", call_sid)
+        stream_url = f"{ws_url}/call/stream/el/{call_sid}"
+    else:
+        # Legacy pipeline mode — greet via Twilio TTS and use our manual pipeline
+        twiml.say(
+            "Hello! AI caller connected. How can I help you today?",
+            voice="alice",
+            language="en-IN",
+        )
+        stream_url = f"{ws_url}/call/stream/{call_sid}"
+
+    connect = Connect()
+    stream = Stream(url=stream_url)
     stream.parameter(name="callSid", value=call_sid)
     connect.append(stream)
     twiml.append(connect)
@@ -286,6 +331,11 @@ async def media_stream(websocket: WebSocket, call_sid: str) -> None:
 
     audio_buffer = b""
     stream_sid = ""
+    # Skip the first N bytes of audio to ignore echo from the Twilio greeting
+    skip_bytes = _GREETING_SKIP_BYTES
+    
+    # Initialize our new smart VAD
+    vad = VADHandler(call_sid=call_sid)
 
     try:
         while True:
@@ -298,20 +348,33 @@ async def media_stream(websocket: WebSocket, call_sid: str) -> None:
 
             elif event == "start":
                 stream_sid = data.get("streamSid", "")
-                logger.info("[%s] Stream started. streamSid=%s", call_sid, stream_sid)
+                logger.info("[%s] Stream started. streamSid=%s | Greeting cooldown: %d bytes", call_sid, stream_sid, skip_bytes)
 
             elif event == "media":
-                # Accumulate audio frames
                 payload = data.get("media", {}).get("payload", "")
                 chunk = decode_twilio_audio(payload)
+
+                # -- Cooldown / deaf period: ignore audio during echo windows --
+                if skip_bytes > 0:
+                    skip_bytes -= len(chunk)
+                    continue
+
+                # Pass chunk to VAD for speech/silence detection
                 audio_buffer += chunk
-
-                # Process when buffer is large enough
-                if len(audio_buffer) >= _AUDIO_BUFFER_MIN_BYTES:
+                
+                if vad.process_pcm_chunk(chunk):
+                    # VAD detected that the user has stopped speaking!
                     buffer_to_process = audio_buffer
-                    audio_buffer = b""  # Reset immediately to avoid overlap
-
+                    
+                    # Reset buffer and VAD state immediately for the next turn
+                    audio_buffer = b""  
+                    vad.is_speaking = False
+                    
                     await _process_turn(state, buffer_to_process, websocket, stream_sid)
+
+                    # After AI speaks, ignore audio for POST_RESPONSE window (response echo)
+                    skip_bytes = _POST_RESPONSE_SKIP_BYTES
+                    logger.info("[%s] Post-response cooldown started (%d bytes).", call_sid, _POST_RESPONSE_SKIP_BYTES)
 
             elif event == "stop":
                 logger.info(

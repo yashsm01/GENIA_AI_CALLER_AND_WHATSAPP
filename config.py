@@ -47,3 +47,9 @@ LANGUAGE_SWITCH_TURNS: int = int(os.getenv("LANGUAGE_SWITCH_TURNS", "2"))
 # ─── GPT Call Settings ────────────────────────────────────────────────────────
 GPT_TEMPERATURE: float = 0.7
 GPT_MAX_TOKENS: int = 300
+
+# ─── ElevenLabs Conversational AI ────────────────────────────────────────────
+# Set USE_ELEVENLABS_CONVAI=true in .env to enable the ConvAI bridge mode.
+# Requires a paid ElevenLabs plan and a created Agent ID.
+USE_ELEVENLABS_CONVAI: bool = os.getenv("USE_ELEVENLABS_CONVAI", "false").lower() == "true"
+ELEVENLABS_AGENT_ID: str = os.getenv("ELEVENLABS_AGENT_ID", "")

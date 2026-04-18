@@ -44,19 +44,23 @@ def decode_twilio_audio(b64_payload: str) -> bytes:
         return b""
 
 
-def encode_audio_for_twilio(pcm_bytes: bytes, sample_rate: int = _MULAW_SAMPLE_RATE) -> str:
+def encode_audio_for_twilio(mulaw_bytes: bytes) -> str:
     """
-    Encode 16-bit PCM audio to base64 μ-law for sending back to Twilio.
+    Encode already-converted μ-law bytes to base64 for sending back to Twilio.
+
+    IMPORTANT: This function expects μ-law bytes as input (NOT raw PCM).
+    Use mp3_to_mulaw() first to convert MP3 → μ-law, then pass the result here.
 
     Args:
-        pcm_bytes:   16-bit mono PCM at `sample_rate`.
-        sample_rate: Sample rate of the input PCM (default 8000).
+        mulaw_bytes: μ-law encoded audio bytes (8kHz, mono).
 
     Returns:
-        Base64-encoded μ-law string suitable for Twilio Media Stream.
+        Base64-encoded string suitable for Twilio Media Stream payload.
     """
     try:
-        mulaw_bytes = audioop.lin2ulaw(pcm_bytes, _SAMPLE_WIDTH)
+        if not mulaw_bytes:
+            logger.error("encode_audio_for_twilio: received empty bytes.")
+            return ""
         return base64.b64encode(mulaw_bytes).decode("utf-8")
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to encode audio for Twilio: %s", exc)
