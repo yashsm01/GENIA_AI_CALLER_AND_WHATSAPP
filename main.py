@@ -18,6 +18,10 @@ import logging
 import sys
 
 import uvicorn
+try:
+    import debugpy
+except ImportError:
+    debugpy = None
 
 import config
 from telephony.call_handler import app  # noqa: F401  (imported for uvicorn)
@@ -74,6 +78,18 @@ def _print_banner() -> None:
 
 if __name__ == "__main__":
     _print_banner()
+
+    # --- Debugging Support ---
+    if "--debug" in sys.argv:
+        if debugpy:
+            logger.info("Debugger enabled. Listening on port 5678...")
+            debugpy.listen(("0.0.0.0", 5678))
+            logger.info("Waiting for debugger to attach...")
+            debugpy.wait_for_client()
+            logger.info("Debugger attached!")
+        else:
+            logger.error("debugpy is not installed. Debugging will not be available.")
+
     uvicorn.run(
         "telephony.call_handler:app",
         host=config.SERVER_HOST,

@@ -90,7 +90,11 @@ def _synthesize_speech(text: str, language: str) -> bytes:
             logger.error("mp3_to_mulaw returned empty bytes.")
         return mulaw
     except Exception as exc:  # noqa: BLE001
-        logger.error("ElevenLabs synthesis failed: %s", exc)
+        logger.error(
+            "ElevenLabs synthesis failed: %s. "
+            "(Check API keys, Tier credits, or Voice/Model ID validity)", 
+            exc
+        )
         return b""
 
 

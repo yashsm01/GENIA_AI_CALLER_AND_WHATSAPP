@@ -181,8 +181,12 @@ def generate_response(state: "ConversationState") -> str:
 
             parsed_calls = tools.parse_tool_calls(message)
             for tc in parsed_calls:
-                # Execute tool
-                result_str = tools.execute_tool(tc["name"], tc["arguments"], state)
+                # Execute tool safely
+                try:
+                    result_str = tools.execute_tool(tc["name"], tc["arguments"], state)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("[%s] Error executing tool %s: %s", state.call_sid, tc["name"], exc)
+                    result_str = f"Error: Tool execution failed due to an internal error ({exc}). Please apologize to the user and offer an alternative."
                 
                 # Append tool result to messages
                 tool_msg = {
