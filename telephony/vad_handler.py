@@ -18,14 +18,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Typical volume thresholds for 16-bit PCM
-# The VAD debug showed line static peaking up to 20,800. Speech peaks are ~26,000.
-ENERGY_THRESHOLD = 22000
+# Normal speech hits 5,000-20,000. True line static is ~100-500.
+ENERGY_THRESHOLD = 1500
 
 # How much silence (in seconds) means the user finished their turn
-SILENCE_TIMEOUT = 0.8
+# Shortened to 0.6s to greatly improve conversational turnaround time.
+SILENCE_TIMEOUT = 0.6
 
 # Minimum duration (in seconds) to be considered real speech instead of random noise
 MIN_SPEECH_DURATION = 0.3
+
+# Maximum duration (in seconds) the user can speak before the AI forces a response
+MAX_SPEECH_DURATION = 10.0
 
 
 class VADHandler:
@@ -41,6 +45,7 @@ class VADHandler:
         self.energy_threshold = energy_threshold
         self.silence_timeout = silence_timeout
         self.min_speech_duration = min_speech_duration
+        self.max_speech_duration = MAX_SPEECH_DURATION
         self.call_sid = call_sid
 
         self.is_speaking = False
@@ -63,9 +68,12 @@ class VADHandler:
 
         now = time.time()
         
-        # Calculate Root Mean Square energy (volume) of the 16-bit PCM chunk
-        # Format "2" means 16-bit (2 byte) audio width
-        rms = audioop.rms(pcm_chunk, 2)
+        # Calculate Root Mean Square energy (volume) by first decoding mu-law to PCM
+        try:
+            pcm_data = audioop.ulaw2lin(pcm_chunk, 2)
+            rms = audioop.rms(pcm_data, 2)
+        except audioop.error:
+            rms = 0
         
         self.max_rms_interval = max(self.max_rms_interval, rms)
         self.min_rms_interval = min(self.min_rms_interval, rms)
@@ -85,6 +93,14 @@ class VADHandler:
                 logger.info(f"[{self.call_sid}] |     [🎤] Speech started (energy: {rms})")
             
             self.last_speech_time = now
+            
+            # -- Max Duration Check --
+            # If the user has been talking continuously for MAX_SPEECH_DURATION, force a cutoff.
+            # if now - self.speech_start_time >= self.max_speech_duration:
+            #     logger.info(f"[{self.call_sid}] |     [⏳] Speech reached max limit ({self.max_speech_duration}s). Forcing turn...")
+            #     self.is_speaking = False
+            #     return True
+                
             return False
             
         else:

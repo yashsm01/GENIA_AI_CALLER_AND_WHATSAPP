@@ -43,6 +43,7 @@ def _get_client() -> OpenAI:
 
 # We add explicit instructions about tools to each prompt.
 _TOOL_INSTRUCTIONS = (
+    "CONVERSATION RULE: If the user greets you (hello, hi, hey), respond with a friendly greeting and ask how you can help. Do not jump immediately into a product explanation.\n\n"
     "You have the ability to send product brochures/documents (Fan or Wire) "
     "via WhatsApp or Email using your tools. "
     "If the user asks for a brochure, catalog, or details about products, "

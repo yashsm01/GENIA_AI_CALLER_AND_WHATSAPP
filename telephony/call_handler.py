@@ -113,7 +113,7 @@ async def _process_turn(
     audio_buffer: bytes,
     websocket: WebSocket,
     stream_sid: str,
-) -> None:
+) -> bool:
     """
     Run one full conversation turn:
     Whisper → Detect → GPT → ElevenLabs → Twilio stream.
@@ -128,7 +128,7 @@ async def _process_turn(
     transcript = whisper_handler.transcribe(audio_buffer, audio_format="mulaw")
     if not transcript:
         logger.info(f"[{sid}] +--- Turn END (empty transcript - no speech detected)")
-        return
+        return False
 
     logger.info(f"[{sid}] |      USER SAID  >> {transcript!r}")
 
@@ -147,9 +147,24 @@ async def _process_turn(
     conversation_state.add_message(state, "user", transcript)
     logger.info(f"[{sid}] | [3/6] History: user message appended (total {len(state.messages)} messages)")
 
-    # -- 4. Generate GPT response -----------------------------------------------
-    logger.info(f"[{sid}] | [4/6] GPT-4o: generating response...")
-    reply = gpt_handler.generate_response(state)
+    # -- 4. Generate response (Greeting skip or GPT) ---------------------------
+    
+    # Clean transcript for greeting detection (remove punctuation)
+    import string
+    cleaned_transcript = transcript.lower().translate(str.maketrans('', '', string.punctuation)).strip()
+    GREETING_WORDS = {"hello", "hi", "hey", "hii", "heya"}
+    
+    is_greeting = cleaned_transcript in GREETING_WORDS
+    
+    if is_greeting:
+        logger.info(f"[{sid}] | [4/6] Greeting detected! Skipping GPT-4o...")
+        if state.turn_count == 0:
+            reply = "Hello! Welcome to SM01. How can I assist you today?"
+        else:
+            reply = "Hi again! What can I do for you?"
+    else:
+        logger.info(f"[{sid}] | [4/6] GPT-4o: generating response...")
+        reply = gpt_handler.generate_response(state)
     conversation_state.add_message(state, "assistant", reply)
     conversation_state.increment_turn(state)
 
@@ -166,7 +181,7 @@ async def _process_turn(
     if not mulaw_audio:
         logger.error(f"[{sid}] |      [!] Voice synthesis FAILED - caller will hear silence this turn.")
         logger.info(f"[{sid}] +--- Turn {state.turn_count} END (synthesis fail)")
-        return
+        return False
 
     logger.info(f"[{sid}] |      [OK] Speech synthesized ({len(mulaw_audio)} mulaw bytes)")
 
@@ -176,13 +191,17 @@ async def _process_turn(
     if not b64_audio:
         logger.error(f"[{sid}] |      [!] Audio encoding FAILED - skipping send.")
         logger.info(f"[{sid}] +--- Turn {state.turn_count} END (encoding fail)")
-        return
+        return False
 
     media_msg = build_twilio_media_message(b64_audio, stream_sid)
     await websocket.send_text(json.dumps(media_msg))
 
     logger.info(f"[{sid}] |      [OK] Audio streamed to caller ({len(b64_audio)} b64 chars)")
     logger.info(f"[{sid}] +--- Turn {state.turn_count} COMPLETE --- (lang={state.current_language} | reply={len(reply)} chars)")
+
+    # Check if any tools executed in this turn requested a call termination
+    should_end = any(a.get("action") == "end_call" for a in state.actions_taken)
+    return should_end
 
 
 # ─── HTTP Endpoints ───────────────────────────────────────────────────────────
@@ -370,11 +389,29 @@ async def media_stream(websocket: WebSocket, call_sid: str) -> None:
                     audio_buffer = b""  
                     vad.is_speaking = False
                     
-                    await _process_turn(state, buffer_to_process, websocket, stream_sid)
+                    should_hangup = await _process_turn(state, buffer_to_process, websocket, stream_sid)
+
+                    if should_hangup:
+                        logger.info("[%s] AI requested call end. Queuing teardown marker.", call_sid)
+                        mark_msg = {
+                            "event": "mark",
+                            "streamSid": stream_sid,
+                            "mark": {"name": "ai_goodbye_complete"}
+                        }
+                        await websocket.send_text(json.dumps(mark_msg))
 
                     # After AI speaks, ignore audio for POST_RESPONSE window (response echo)
                     skip_bytes = _POST_RESPONSE_SKIP_BYTES
                     logger.info("[%s] Post-response cooldown started (%d bytes).", call_sid, _POST_RESPONSE_SKIP_BYTES)
+
+            elif event == "mark":
+                mark_name = data.get("mark", {}).get("name", "")
+                if mark_name == "ai_goodbye_complete":
+                    logger.info("[%s] Goodbye message finished playing. Disconnecting call.", call_sid)
+                    try:
+                        twilio_client.calls(call_sid).update(status="completed")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("[%s] Failed to hang up call via Twilio REST API: %s", call_sid, exc)
 
             elif event == "stop":
                 logger.info(

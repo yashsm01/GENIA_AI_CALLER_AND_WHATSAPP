@@ -17,7 +17,7 @@ OPENAI_WHISPER_MODEL: str = os.getenv("OPENAI_WHISPER_MODEL", "whisper-1")
 
 # ─── ElevenLabs ───────────────────────────────────────────────────────────────
 ELEVENLABS_API_KEY: str = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_MODEL_ID: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+ELEVENLABS_MODEL_ID: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 
 # "multilingual" → single voice for all languages (MVP)
 # "per_language"  → separate voice per language code
