@@ -30,10 +30,27 @@ logger = logging.getLogger(__name__)
 
 _client: OpenAI | None = None
 
+# Per-call API key overrides (call_sid → api_key)
+_call_overrides: dict[str, str] = {}
 
-def _get_client() -> OpenAI:
-    """Lazy-initialize the OpenAI client."""
+
+def _override_api_key(call_sid: str, api_key: str) -> None:
+    """Set a per-call OpenAI API key override for this call session."""
+    if api_key:
+        _call_overrides[call_sid] = api_key
+
+
+def _clear_override(call_sid: str) -> None:
+    """Remove the per-call override after the call ends."""
+    _call_overrides.pop(call_sid, None)
+
+
+def _get_client(call_sid: str = "") -> OpenAI:
+    """Get an OpenAI client — per-call key if available, else default."""
     global _client  # noqa: PLW0603
+    key = _call_overrides.get(call_sid)
+    if key:
+        return OpenAI(api_key=key)
     if _client is None:
         _client = OpenAI(api_key=config.OPENAI_API_KEY)
     return _client
@@ -135,7 +152,7 @@ def generate_response(state: "ConversationState") -> str:
     system_prompt = get_system_prompt(state.current_language)
     messages = [{"role": "system", "content": system_prompt}] + list(state.messages)
 
-    client = _get_client()
+    client = _get_client(state.call_sid)
     max_loops = 3
     loop_count = 0
 

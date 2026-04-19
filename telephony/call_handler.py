@@ -41,6 +41,7 @@ from telephony.audio_utils import (
     build_twilio_media_message,
 )
 from telephony.vad_handler import VADHandler
+from database import sqlite_manager
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +60,18 @@ app.add_middleware(
 from telephony import elevenlabs_bridge  # noqa: E402
 app.include_router(elevenlabs_bridge.router)
 
-# ─── Clients ──────────────────────────────────────────────────────────────────
+# ─── Clients (default — used when no per-user creds exist) ───────────────────
 
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
+# ─── Per-Call Session Clients ─────────────────────────────────────────────────
+# call_sid → {"elevenlabs": ElevenLabs, "openai_key": str, "creds": dict}
+_session_clients: dict[str, dict] = {}
+
 # ─── Active Sessions ──────────────────────────────────────────────────────────
 
-# call_sid -> ConversationState
+# call_sid → ConversationState
 _active_calls: dict[str, conversation_state.ConversationState] = {}
 
 # Bytes to skip at the start of a call to absorb the Twilio greeting echo
@@ -81,18 +86,24 @@ _POST_RESPONSE_SKIP_BYTES = 12_000
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 
-def _synthesize_speech(text: str, language: str) -> bytes:
+def _synthesize_speech(text: str, language: str, call_sid: str = "") -> bytes:
     """
     Generate speech via ElevenLabs and return as μ-law bytes for Twilio.
-
-    Returns empty bytes on failure (call continues silently).
+    Uses per-call client if available, else falls back to default.
+    Returns empty bytes on failure.
     """
-    voice_cfg = voice_selector.get_voice_config(language)
+    session = _session_clients.get(call_sid, {})
+    client  = session.get("elevenlabs") or elevenlabs_client
+    creds   = session.get("creds") or {}
+
+    voice_id = creds.get("elevenlabs_voice_id") or config.ELEVENLABS_VOICE_ID_MULTILINGUAL
+    model_id = config.ELEVENLABS_MODEL_ID
+
     try:
-        audio_generator = elevenlabs_client.text_to_speech.convert(
+        audio_generator = client.text_to_speech.convert(
             text=text,
-            voice_id=voice_cfg["voice_id"],
-            model_id=voice_cfg["model_id"],
+            voice_id=voice_id,
+            model_id=model_id,
         )
         mp3_bytes = b"".join(audio_generator)
         mulaw = mp3_to_mulaw(mp3_bytes)
@@ -102,7 +113,7 @@ def _synthesize_speech(text: str, language: str) -> bytes:
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "ElevenLabs synthesis failed: %s. "
-            "(Check API keys, Tier credits, or Voice/Model ID validity)", 
+            "(Check API keys, Tier credits, or Voice/Model ID validity)",
             exc
         )
         return b""
@@ -125,7 +136,7 @@ async def _process_turn(
 
     # -- 1. Transcribe ---------------------------------------------------------
     logger.info(f"[{sid}] | [1/6] Whisper: transcribing {len(audio_buffer)} bytes of mulaw audio...")
-    transcript = whisper_handler.transcribe(audio_buffer, audio_format="mulaw")
+    transcript = whisper_handler.transcribe(audio_buffer, audio_format="mulaw", call_sid=sid)
     if not transcript:
         logger.info(f"[{sid}] +--- Turn END (empty transcript - no speech detected)")
         return False
@@ -177,7 +188,7 @@ async def _process_turn(
 
     # -- 5. Synthesize voice ---------------------------------------------------
     logger.info(f"[{sid}] | [5/6] ElevenLabs: synthesizing speech ({len(reply)} chars)...")
-    mulaw_audio = _synthesize_speech(reply, state.current_language)
+    mulaw_audio = _synthesize_speech(reply, state.current_language, call_sid=sid)
     if not mulaw_audio:
         logger.error(f"[{sid}] |      [!] Voice synthesis FAILED - caller will hear silence this turn.")
         logger.info(f"[{sid}] +--- Turn {state.turn_count} END (synthesis fail)")
@@ -232,11 +243,27 @@ async def handle_inbound_call(request: Request) -> Response:
     except AssertionError as exc:
         raise HTTPException(status_code=400, detail="multipart form parse error") from exc
 
-    call_sid = form.get("CallSid", "unknown")
+    call_sid      = form.get("CallSid", "unknown")
     caller_number = form.get("From", "")
     called_number = form.get("To", "")
 
     logger.info("Inbound call received: %s (From: %s)", call_sid, caller_number)
+
+    # ── Dynamic credential lookup from SQLite hot cache ──────────────────────
+    creds = sqlite_manager.get_credentials_by_phone(called_number)
+    if creds:
+        logger.info("[%s] Loaded per-user credentials for %s", call_sid, called_number)
+        from openai import OpenAI as _OpenAI
+        _session_clients[call_sid] = {
+            "elevenlabs": ElevenLabs(api_key=creds["elevenlabs_key"]),
+            "openai_key": creds["openai_key"],
+            "creds":      creds,
+        }
+        # Patch the whisper handler key for this session
+        whisper_handler._override_api_key(call_sid, creds["openai_key"])
+        gpt_handler._override_api_key(call_sid, creds["openai_key"])
+    else:
+        logger.info("[%s] No per-user creds found for %s — using .env defaults.", call_sid, called_number)
 
     # Initialize conversation state for this call
     state = conversation_state.create_state(
@@ -430,4 +457,8 @@ async def media_stream(websocket: WebSocket, call_sid: str) -> None:
     finally:
         # Clean up session
         _active_calls.pop(call_sid, None)
-        logger.info("[%s] Session cleaned up.", call_sid)
+        # Cleanup session client cache
+    _session_clients.pop(call_sid, None)
+    whisper_handler._clear_override(call_sid)
+    gpt_handler._clear_override(call_sid)
+    logger.info("[%s] Session cleaned up.", call_sid)

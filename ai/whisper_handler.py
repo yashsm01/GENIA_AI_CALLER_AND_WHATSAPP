@@ -40,10 +40,27 @@ _WHISPER_SAMPLE_RATE = 16000  # Hz — Whisper performs best at 16kHz
 # Shorter clips often produce empty or noisy transcripts
 _MIN_AUDIO_DURATION_SECS = 0.5
 
+# Per-call API key overrides (call_sid → api_key)
+_call_overrides: dict[str, str] = {}
 
-def _get_client() -> OpenAI:
-    """Lazy-initialize the OpenAI client."""
+
+def _override_api_key(call_sid: str, api_key: str) -> None:
+    """Set a per-call OpenAI API key override for this call session."""
+    if api_key:
+        _call_overrides[call_sid] = api_key
+
+
+def _clear_override(call_sid: str) -> None:
+    """Remove the per-call override after the call ends."""
+    _call_overrides.pop(call_sid, None)
+
+
+def _get_client(call_sid: str = "") -> OpenAI:
+    """Get an OpenAI client — per-call key if available, else default."""
     global _client  # noqa: PLW0603
+    key = _call_overrides.get(call_sid)
+    if key:
+        return OpenAI(api_key=key)
     if _client is None:
         _client = OpenAI(api_key=config.OPENAI_API_KEY)
     return _client
@@ -140,13 +157,14 @@ def _is_audio_long_enough(wav_bytes: bytes) -> bool:
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 
-def transcribe(audio_bytes: bytes, audio_format: str = "mulaw") -> str:
+def transcribe(audio_bytes: bytes, audio_format: str = "mulaw", call_sid: str = "") -> str:
     """
     Transcribe speech audio to text using OpenAI Whisper.
 
     Args:
         audio_bytes:  Raw audio bytes.
         audio_format: "mulaw" (Twilio default) or "wav" (pre-converted).
+        call_sid:     Twilio Call SID string for session identity.
 
     Returns:
         Transcribed text string, or empty string on failure/short audio.
@@ -171,7 +189,7 @@ def transcribe(audio_bytes: bytes, audio_format: str = "mulaw") -> str:
         return ""
 
     # ── Call Whisper API ──────────────────────────────────────────────────────
-    client = _get_client()
+    client = _get_client(call_sid)
     audio_file = io.BytesIO(wav_bytes)
     audio_file.name = "audio.wav"
 

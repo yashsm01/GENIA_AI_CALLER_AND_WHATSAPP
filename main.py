@@ -1,36 +1,25 @@
 """
 main.py — AI Auto Caller entry point.
 
-Starts the FastAPI/uvicorn server and prints a startup configuration summary.
-
-Usage:
-    python main.py
-
-Or with uvicorn directly:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-For telephony testing (expose local server to Twilio/internet):
-    ngrok http 8000
-    Then set PUBLIC_BASE_URL in .env to your ngrok URL.
+Starts the FastAPI/uvicorn server, initializes databases, mounts API routers,
+and serves the React frontend from the /app path.
 """
 
 import logging
 import sys
-
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
-try:
-    import debugpy
-except ImportError:
-    debugpy = None
 
 import config
-from telephony.call_handler import app  # noqa: F401  (imported for uvicorn)
+from telephony.call_handler import app
+from database import sqlite_manager
+from database.mongo_manager import init_mongo, close_mongo
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
-
-# Force UTF-8 output so terminal doesn't mangle characters
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,62 +27,79 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-
 logger = logging.getLogger(__name__)
 
+# ─── Lifespan (startup / shutdown) ───────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
+    logger.info("[Startup] Initializing SQLite hot cache...")
+    sqlite_manager.initialize_db()
+
+    logger.info("[Startup] Connecting to MongoDB...")
+    try:
+        await init_mongo()
+    except Exception as exc:
+        logger.error("[Startup] MongoDB connection failed: %s", exc)
+        import traceback
+        traceback.print_exc()
+
+    yield
+    await close_mongo()
+    logger.info("[Shutdown] MongoDB connection closed.")
+
+app.router.lifespan_context = lifespan
+
+# ─── Static Files & SPA Fallback ──────────────────────────────────────────────
+# We mount this BEFORE routers to ensure assets take precedence if there's any conflict
+
+_FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.exists():
+    # Mount the dist folder. html=True handles /app -> /app/index.html
+    app.mount("/app", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+    logger.info("[Frontend] React dashboard mounted at /app")
+else:
+    logger.warning("[Frontend] No dist build found at %s", _FRONTEND_DIST)
+
+# ─── Mount API Routers ────────────────────────────────────────────────────────
+
+from api.auth import router as auth_router
+from api.documents import router as documents_router
+from api.calls import router as calls_router
+from api.settings import router as settings_router
+
+app.include_router(auth_router)
+app.include_router(documents_router)
+app.include_router(calls_router)
+app.include_router(settings_router)
+
+# ─── SPA Fallback ─────────────────────────────────────────────────────────────
+
+@app.exception_handler(404)
+async def spa_fallback(request, exc):
+    # If the request starts with /app but wasn't found by StaticFiles, it's a React route
+    if request.url.path.startswith("/app"):
+        return FileResponse(str(_FRONTEND_DIST / "index.html"))
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 # ─── Startup Banner ───────────────────────────────────────────────────────────
 
 def _print_banner() -> None:
-    """Print startup configuration summary (masks sensitive keys)."""
-
-    def mask(value: str) -> str:
-        if not value:
-            return "⚠️  NOT SET"
-        if len(value) <= 8:
-            return "****"
-        return value[:4] + "****" + value[-4:]
+    def mask(v: str) -> str:
+        return (v[:4] + "****" + v[-4:]) if v and len(v) > 8 else "****"
 
     print("\n" + "=" * 60)
-    print("  AI AUTO CALLER — Starting Up")
+    print("  AI AUTO CALLER — Multi-tenant SaaS")
     print("=" * 60)
-    print(f"  Server        : {config.SERVER_HOST}:{config.SERVER_PORT}")
-    print(f"  Public URL    : {config.PUBLIC_BASE_URL}")
-    print(f"  GPT Model     : {config.OPENAI_MODEL}")
-    print(f"  Whisper Model : {config.OPENAI_WHISPER_MODEL}")
-    print(f"  Voice Mode    : {config.VOICE_MODE}")
-    print(f"  Default Lang  : {config.DEFAULT_LANGUAGE}")
-    print(f"  OpenAI Key    : {mask(config.OPENAI_API_KEY)}")
-    print(f"  ElevenLabs Key: {mask(config.ELEVENLABS_API_KEY)}")
-    print(f"  Twilio SID    : {mask(config.TWILIO_ACCOUNT_SID)}")
-    print(f"  Twilio Phone  : {config.TWILIO_PHONE_NUMBER or '⚠️  NOT SET'}")
-
-    if config.VOICE_MODE == "multilingual":
-        print(f"  Voice ID      : {mask(config.ELEVENLABS_VOICE_ID_MULTILINGUAL)}")
-    else:
-        print(f"  Voice EN      : {mask(config.ELEVENLABS_VOICE_ID_EN)}")
-        print(f"  Voice HI      : {mask(config.ELEVENLABS_VOICE_ID_HI)}")
-        print(f"  Voice GU      : {mask(config.ELEVENLABS_VOICE_ID_GU)}")
-
+    print(f"  Dashboard     : {config.PUBLIC_BASE_URL}/app")
+    print(f"  MongoDB       : {os.getenv('MONGODB_URI', 'mongodb://localhost:27017')[:30]}...")
+    print(f"  Twilio Phone  : {config.TWILIO_PHONE_NUMBER}")
     print("=" * 60 + "\n")
-
-
-# ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     _print_banner()
-
-    # --- Debugging Support ---
-    if "--debug" in sys.argv:
-        if debugpy:
-            logger.info("Debugger enabled. Listening on port 5678...")
-            debugpy.listen(("0.0.0.0", 5678))
-            logger.info("Waiting for debugger to attach...")
-            debugpy.wait_for_client()
-            logger.info("Debugger attached!")
-        else:
-            logger.error("debugpy is not installed. Debugging will not be available.")
-
     uvicorn.run(
         "telephony.call_handler:app",
         host=config.SERVER_HOST,
